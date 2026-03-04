@@ -1,3 +1,11 @@
+// DP2PS - Distributed P2P Storage System
+// Rihan | BSSE1630
+//
+// Each node keeps a peers.txt of everyone it knows.
+// When you join you shout I_AM_NEW and everyone replies with their info.
+// Files go over TCP, discovery goes over UDP broadcast.
+// Big files use the chunk server so multiple peers can help upload at once.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,16 +14,24 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 #include <errno.h>
+   
 
+   
 #ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
-
 typedef SOCKET SocketType;
 #define CLOSE_SOCKET closesocket
+
+CRITICAL_SECTION peerLock;
+#define PEER_LOCK()   EnterCriticalSection(&peerLock)
+
+
+#define PEER_UNLOCK() LeaveCriticalSection(&peerLock)
+
 #else
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -26,9 +42,14 @@ typedef SOCKET SocketType;
 
 pthread_mutex_t peerLock = PTHREAD_MUTEX_INITIALIZER;
 
+#define PEER_LOCK()   pthread_mutex_lock(&peerLock)
+
+#define PEER_UNLOCK() pthread_mutex_unlock(&peerLock)
 
 typedef int SocketType;
 #define CLOSE_SOCKET close
+
+
 #define INVALID_SOCKET -1
 #endif
 
@@ -55,6 +76,8 @@ long long myAvail;
 #define PEER_FILE "peers.txt"
 #define MAX_FILES 20
 #define MAX_FILENAME 128
+#define CHUNK_SIZE (512 * 1024)
+#define CHUNK_PORT 44681       
 
 void getCurrentTime(char *buffer, size_t size);
 time_t convertToTimeT(const char *timestamp);
@@ -64,9 +87,12 @@ void broadcastUpdateLine(const char *myTimeStr, const char *myMAC, const char *m
                          const char *myName, long long myTotal, long long myAvail,
                          int filecount, char filenames[][128], int PORT);
 int loadPeersFromTmp(const char *file);
+// upsert: update the existing entry for this MAC, or add a new one
 void addOrUpdatePeers(const char *timeStr, const char *mac, const char *ip,
                       const char *name, long long total, long long avail,
                       int fileCount, char files[][128]);
+void writeMyInfo(const char *s1, const char *s2, const char *s3, const char *s4,
+                 long long n1, long long n2);
 
 typedef struct
 {
@@ -117,8 +143,8 @@ int loadPeersFromTmp(const char *file)
 
     if (!fp)
     {
-        printf("[Info] No temp file to merge.\n");
-        return 0; 
+        
+        return 0;
     }
 
     char line[1024];
@@ -162,14 +188,13 @@ int loadPeersFromTmp(const char *file)
             }
         }
 
-      
         addOrUpdatePeers(timeStr, mac, ip, name, total, avail, filecount, filenames);
         addedCount++;
     }
 
     fclose(fp);
-   
-    return 1; 
+
+    return 1;
 }
 
 void sleep_ms(int milliseconds)
@@ -205,7 +230,7 @@ void getMyMAC(char *macOut)
         {
             char c = line[i];
             if (c == '-')
-                c = ':'; 
+                c = ':';
             macOut[j++] = tolower((unsigned char)c);
         }
     }
@@ -227,7 +252,7 @@ void getMyMAC(char *macOut)
     char line[256];
     if (fgets(line, sizeof(line), fp))
     {
-      
+
         int j = 0;
         for (int i = 0; line[i] != '\0' && j < 17; i++)
         {
@@ -299,7 +324,7 @@ void getMyName(char *nameOut)
 #endif
 }
 
-
+// reads the saved peer list from disk on startup
 void loadPeers(const char *file)
 {
     FILE *fp = fopen(file, "r");
@@ -307,7 +332,6 @@ void loadPeers(const char *file)
 
     if (!fp)
     {
-        printf("[Info] No saved peers yet.\n");
         return;
     }
 
@@ -349,7 +373,7 @@ void loadPeers(const char *file)
 
         if (fileList && strlen(fileList) > 0)
         {
-            
+
             char fileListCopy[512];
             strncpy(fileListCopy, fileList, sizeof(fileListCopy) - 1);
             fileListCopy[sizeof(fileListCopy) - 1] = '\0';
@@ -370,15 +394,14 @@ void loadPeers(const char *file)
     }
 
     fclose(fp);
-    printf("[Loaded] %d peer(s)\n", peerCount);
 }
 
+// overwrites peers.txt with current state — simple but works fine at this scale
 void savePeers(const char *file)
 {
     FILE *fp = fopen(file, "w");
     if (!fp)
     {
-        printf("[Error] Could not open file for writing: %s\n", file);
         return;
     }
 
@@ -417,9 +440,10 @@ void addOrUpdatePeers(const char *timeStr, const char *mac, const char *ip,
     if (!mac || !ip)
         return;
 
-   
     if (fileCount > MAX_FILES)
         fileCount = MAX_FILES;
+
+    PEER_LOCK();
 
     for (int i = 0; i < peerCount; i++)
     {
@@ -448,6 +472,7 @@ void addOrUpdatePeers(const char *timeStr, const char *mac, const char *ip,
 
             sortPeers();
             savePeers("peers.txt");
+            PEER_UNLOCK();
             return;
         }
     }
@@ -481,10 +506,12 @@ void addOrUpdatePeers(const char *timeStr, const char *mac, const char *ip,
         peerCount++;
         sortPeers();
         savePeers("peers.txt");
+        PEER_UNLOCK();
     }
     else
     {
-        printf("[Warning] Maximum peers reached (%d). Cannot add new peer.\n", MAX_PEERS);
+        PEER_UNLOCK();
+        printf("Maximum peers reached (%d).Cannot add new peer.\n", MAX_PEERS);
     }
 }
 
@@ -505,21 +532,23 @@ void showPeers()
     if (peerCount == 0)
     {
         printf("\n  No peers found yet!\n");
-        printf("  Try the 'discover' command first.\n\n");
+        
         return;
     }
 
-    printf("\n  ========== Known Peers (%d) ==========\n", peerCount);
+    printf("\n  ========Known Peers (%d)========\n", peerCount);
+
+    PEER_LOCK();
     for (int i = 0; i < peerCount; i++)
     {
         Peer *p = &peerList[i];
 
         printf("  [%d] %s\n", i + 1, p->name);
-        printf("      IP:    %s\n", p->ip);
-        printf("      MAC:   %s\n", p->mac);
-        printf("      Time:  %s\n", p->timeStr);
-        printf("      TOTAL: %lld MB\n", p->total / (1024 * 1024));
-        printf("      AVAIL: %lld MB\n", p->avail / (1024 * 1024));
+          printf(" IP: %s\n", p->ip);
+        printf("  MAC: %s\n", p->mac);
+          printf(" Time: %s\n", p->timeStr);
+        printf(" TOTAL: %lld MB\n", p->total / (1024 * 1024));
+        printf("   AVAIL: %lld MB\n", p->avail / (1024 * 1024));
 
         if (p->fileCount == 0)
         {
@@ -536,6 +565,7 @@ void showPeers()
 
         printf("\n");
     }
+    PEER_UNLOCK();
 }
 
 char *findPeer(const char *target)
@@ -559,10 +589,10 @@ char *findPeer(const char *target)
         return findIPByMAC(target);
     }
 
-    for (int i = 0; i < peerCount; i++)
+    for (int i=0;i<peerCount;i++)
     {
         if (strcmp(peerList[i].name, target) == 0)
-        {
+        {                            
             return peerList[i].ip;
         }
     }
@@ -578,7 +608,6 @@ int comparePeersByTime(const void *a, const void *b)
     time_t ta = convertToTimeT(pa->timeStr);
     time_t tb = convertToTimeT(pb->timeStr);
 
-
     if (ta > tb)
         return -1;
     if (ta < tb)
@@ -587,9 +616,8 @@ int comparePeersByTime(const void *a, const void *b)
 }
 void sortPeers()
 {
-    qsort(peerList, peerCount, sizeof(Peer), comparePeersByTime);
+    qsort(peerList, peerCount, sizeof(Peer), comparePeersByTime);  // newest first
 }
-
 
 void addFileToPeer(Peer *p, const char *filename)
 {
@@ -629,7 +657,7 @@ void getPeersSortedByAvail(int sorted[], int count)
 long long getFileSize(const char *filepath)
 {
 #ifdef _WIN32
-    
+
     struct stat st;
 
     if (stat(filepath, &st) != 0)
@@ -639,7 +667,7 @@ long long getFileSize(const char *filepath)
 
     return (long long)st.st_size;
 #else
-  
+
     struct stat st;
 
     if (stat(filepath, &st) != 0)
@@ -666,38 +694,34 @@ int recvAll(SocketType sock, char *buffer, int length)
     return totalReceived;
 }
 
+// runs on the file server thread each time someone connects and pushes a file to us
 void receiveFile(SocketType clientSocket, const char *senderIP)
 {
     char buffer[BUFFER_SIZE];
 
-    
-
-    
     uint32_t infoLen;
     if (recvAll(clientSocket, (char *)&infoLen, sizeof(infoLen)) < 0)
     {
-        printf("    [Error] Failed to receive info length\n");
+        
         return;
     }
-  
-    infoLen = ntohl(infoLen); 
-   
 
-    // Safety check
+    infoLen = ntohl(infoLen);
+
+   
     if (infoLen > 1024)
     {
-        printf("    [Error] Invalid info length: %u\n", infoLen);
+        
         return;
     }
 
     char info[1024];
     if (recvAll(clientSocket, info, infoLen) < 0)
     {
-        printf("    [Error] Failed to receive peer info\n");
+        
         return;
     }
     info[infoLen] = 0;
-   
 
     char infoCopy[1024];
     strcpy(infoCopy, info);
@@ -708,47 +732,42 @@ void receiveFile(SocketType clientSocket, const char *senderIP)
     uint32_t nameLen;
     if (recvAll(clientSocket, (char *)&nameLen, sizeof(nameLen)) < 0)
     {
-        printf("    [Error] Failed to receive filename length\n");
         return;
     }
-   
+
     nameLen = ntohl(nameLen);
-   
 
     if (nameLen > 1024)
     {
-        printf("    [Error] Invalid filename length: %u\n", nameLen);
         return;
     }
 
     char filename[1024];
     if (recvAll(clientSocket, filename, nameLen) < 0)
     {
-        printf("    [Error] Failed to receive filename\n");
         return;
     }
     filename[nameLen] = 0;
-  
 
     FILE *file = fopen(filename, "wb");
     if (!file)
     {
-        printf("    [Error] Cannot create file: %s\n", filename);
         return;
     }
 
-    int totalBytes = 0;
+    long long totalBytes = 0;  // needs to be long long – int overflows at 2 GB
     int bytes;
-  
+
     fflush(stdout);
-    int flag =0;
+    int flag = 0;
     while ((bytes = recv(clientSocket, buffer, BUFFER_SIZE, 0)) > 0)
     {
         fwrite(buffer, 1, bytes, file);
         totalBytes += bytes;
-        if(flag==100){
-        printf(".");
-        flag=0;
+        if (flag == 100)
+        {
+            printf(".");
+            flag = 0;
         }
 
         flag++;
@@ -756,8 +775,48 @@ void receiveFile(SocketType clientSocket, const char *senderIP)
     }
 
     fclose(file);
-    printf(" Complete! (%d bytes)\n", totalBytes);
+    printf(" Complete! (%lld bytes)\n", totalBytes);
+
+
+    if (totalBytes <= 0) return;
+
+    // update our own record now that we're holding this file
+    PEER_LOCK();
+    int myIdx = -1;
+    for (int i = 0; i < peerCount; i++)
+        if (strcmp(peerList[i].mac, myMAC) == 0) { myIdx = i; break; }
+
+    if (myIdx >= 0)
+    {
+        char curTime[64];
+        getCurrentTime(curTime, sizeof(curTime));
+        strncpy(peerList[myIdx].timeStr, curTime, sizeof(peerList[myIdx].timeStr) - 1);
+        peerList[myIdx].avail -= totalBytes;
+        if (peerList[myIdx].avail < 0) peerList[myIdx].avail = 0;
+
+        bool alreadyHave = false;
+        for (int f = 0; f < peerList[myIdx].fileCount; f++)
+            if (strcmp(peerList[myIdx].files[f], filename) == 0) { alreadyHave = true; break; }
+        if (!alreadyHave)
+            addFileToPeer(&peerList[myIdx], filename);
+
+        // snapshot before unlock so broadcastUpdateLine runs outside the lock
+        char tsnap[64]; strncpy(tsnap, curTime, 63);
+        long long tot = peerList[myIdx].total, av = peerList[myIdx].avail;
+        int fc = peerList[myIdx].fileCount;
+        char fsnap[MAX_FILES][MAX_FILENAME];
+        memcpy(fsnap, peerList[myIdx].files, sizeof(fsnap));
+        sortPeers();
+        savePeers("peers.txt");
+        PEER_UNLOCK();
+
+        broadcastUpdateLine(tsnap, myMAC, myIP, myName, tot, av, fc, fsnap, DISCOVERY_PORT);
+        writeMyInfo(tsnap, myMAC, myIP, myName, tot, av);
+        printf("  [Info] Updated: now storing '%s'\n", filename);
+    }
+    else { PEER_UNLOCK(); }
 }
+// walks the peer list sorted by available space and returns the first one we can actually connect to
 void findBestPeer(char **bestIP, int *peerIndex)
 {
     if (bestIP)
@@ -787,12 +846,10 @@ void findBestPeer(char **bestIP, int *peerIndex)
         printf("    [Checking] %s (%s) - %lld MB available\n",
                peerList[i].name, ip, peerList[i].avail / (1024 * 1024));
 
-       
         if (strcmp(peerList[i].mac, myMAC) == 0)
         {
             printf("    [Note] This is your machine\n");
 
-           
             if (bestIP && *bestIP == NULL)
             {
                 *bestIP = ip;
@@ -803,7 +860,6 @@ void findBestPeer(char **bestIP, int *peerIndex)
             break;
         }
 
-        
         SocketType testSock = socket(AF_INET, SOCK_STREAM, 0);
         if (testSock == INVALID_SOCKET)
             continue;
@@ -821,7 +877,7 @@ void findBestPeer(char **bestIP, int *peerIndex)
 
         if (connect(testSock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
         {
-           
+
             CLOSE_SOCKET(testSock);
 
             if (bestIP)
@@ -829,11 +885,10 @@ void findBestPeer(char **bestIP, int *peerIndex)
             if (peerIndex)
                 *peerIndex = i;
 
-            return; 
+            return;
         }
 
         CLOSE_SOCKET(testSock);
-        printf("    [Offline] %s is not reachable\n", peerList[i].name);
     }
 
     if (flag == 1)
@@ -845,11 +900,9 @@ void findBestPeer(char **bestIP, int *peerIndex)
 
     if (bestIP && *bestIP != NULL)
     {
-        printf("    [Fallback] No remote peers available, using local storage\n");
     }
     else
     {
-        printf("    [Error] No available peers found\n");
     }
 }
 
@@ -858,20 +911,15 @@ void sendFile(const char *filepath, const char *targetPeer)
     char *ip = findPeer(targetPeer);
     if (!ip)
     {
-        printf("    [Error] Peer not found!\n");
-        printf("    Use 'list' to see available peers.\n");
+        printf("  Peer not found!\n");
+        
         return;
     }
 
     FILE *file = fopen(filepath, "rb");
     if (!file)
     {
-        printf("    [Error] File not found: %s\n\n", filepath);
-        printf("    TIPS:\n");
-        printf("    - On Windows, include the drive letter: C:\\Users\\...\n");
-        printf("    - Or use forward slashes: C:/Users/...\n");
-        printf("    - Use quotes if path has spaces: \"C:/My Files/photo.jpg\"\n");
-        printf("    - Or drag & drop the file into this window!\n\n");
+        
         return;
     }
 
@@ -892,13 +940,12 @@ void sendFile(const char *filepath, const char *targetPeer)
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         printf("    [Error] Cannot connect to %s\n", ip);
-        printf("    Make sure they're running the program!\n");
+        
         fclose(file);
         CLOSE_SOCKET(sock);
         return;
     }
 
-    
     char myMAC[32], myIP[64], myName[256];
     getMyMAC(myMAC);
     getMyIP(myIP);
@@ -906,14 +953,14 @@ void sendFile(const char *filepath, const char *targetPeer)
 
     char info[256];
     snprintf(info, sizeof(info), "%s|%s|%s", myMAC, myIP, myName);
-    uint32_t infoLen = htonl(strlen(info)); 
+    uint32_t infoLen = htonl(strlen(info));
     send(sock, (char *)&infoLen, sizeof(infoLen), 0);
     send(sock, info, ntohl(infoLen), 0);
 
-    char *filename = strrchr(filepath, '/');
+    const char *filename = strrchr(filepath, '/');
     if (!filename)
         filename = strrchr(filepath, '\\');
-    filename = filename ? filename + 1 : (char *)filepath;
+    filename = filename ? filename + 1 : filepath;
 
     uint32_t nameLen = htonl(strlen(filename));
     send(sock, (char *)&nameLen, sizeof(nameLen), 0);
@@ -925,14 +972,15 @@ void sendFile(const char *filepath, const char *targetPeer)
 
     printf("    [Sending] %s", filename);
     fflush(stdout);
-    int flag =0;
+    int flag = 0;
     while ((bytes = fread(buffer, 1, BUFFER_SIZE, file)) > 0)
     {
         send(sock, buffer, bytes, 0);
         totalBytes += bytes;
-        if(flag==100){
-        printf(".");
-        flag=0;
+        if (flag == 100)
+        {
+            printf(".");
+            flag = 0;
         }
         fflush(stdout);
         flag++;
@@ -942,6 +990,373 @@ void sendFile(const char *filepath, const char *targetPeer)
 
     fclose(file);
     CLOSE_SOCKET(sock);
+}
+
+
+#ifdef _WIN32
+typedef CRITICAL_SECTION SwarmMutex;
+#define SWARM_MUTEX_INIT(m) InitializeCriticalSection(m)
+#define SWARM_MUTEX_LOCK(m) EnterCriticalSection(m)
+#define SWARM_MUTEX_UNLOCK(m) LeaveCriticalSection(m)
+#define SWARM_MUTEX_DESTROY(m) DeleteCriticalSection(m)
+#else
+typedef pthread_mutex_t SwarmMutex;
+#define SWARM_MUTEX_INIT(m) pthread_mutex_init(m, NULL)
+#define SWARM_MUTEX_LOCK(m) pthread_mutex_lock(m)
+#define SWARM_MUTEX_UNLOCK(m) pthread_mutex_unlock(m)
+#define SWARM_MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+#endif
+
+
+typedef struct
+{
+    char peerIP[64];
+    char filename[256];
+    int chunkIdx;
+    int *doneCounter;
+    SwarmMutex *lock; 
+} ChunkArgs;
+
+
+#ifdef _WIN32
+DWORD WINAPI downloadOneChunk(LPVOID arg)
+#else
+void *downloadOneChunk(void *arg)
+#endif
+{
+    ChunkArgs *a = (ChunkArgs *)arg;
+
+    SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(CHUNK_PORT);
+
+#ifdef _WIN32
+    addr.sin_addr.s_addr = inet_addr(a->peerIP);
+#else
+    inet_pton(AF_INET, a->peerIP, &addr.sin_addr);
+#endif
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        printf("  [Swarm] Cannot reach %s for chunk %d\n", a->peerIP, a->chunkIdx);
+        SWARM_MUTEX_LOCK(a->lock); (*a->doneCounter)++; SWARM_MUTEX_UNLOCK(a->lock);
+        free(a); CLOSE_SOCKET(sock); return 0;
+    }
+
+    char req[512];
+    snprintf(req, sizeof(req), "CHUNK|%s|%d\n", a->filename, a->chunkIdx);
+    send(sock, req, (int)strlen(req), 0);
+
+    uint32_t sizeNet;
+    if (recvAll(sock, (char *)&sizeNet, 4) < 0)
+    {
+        SWARM_MUTEX_LOCK(a->lock); (*a->doneCounter)++; SWARM_MUTEX_UNLOCK(a->lock);
+        free(a); CLOSE_SOCKET(sock); return 0;
+    }
+    int chunkSize = (int)ntohl(sizeNet);
+
+    char *buf = (char *)malloc(chunkSize);
+    if (!buf)
+    {
+        SWARM_MUTEX_LOCK(a->lock); (*a->doneCounter)++; SWARM_MUTEX_UNLOCK(a->lock);
+        free(a); CLOSE_SOCKET(sock); return 0;
+    }
+
+    if (recvAll(sock, buf, chunkSize) < 0)
+    {
+        SWARM_MUTEX_LOCK(a->lock); (*a->doneCounter)++; SWARM_MUTEX_UNLOCK(a->lock);
+        free(buf); free(a); CLOSE_SOCKET(sock); return 0;
+    }
+    CLOSE_SOCKET(sock);
+
+    FILE *f = fopen(a->filename, "r+b");
+    if (f)
+    {
+        fseek(f, (long long)a->chunkIdx * CHUNK_SIZE, SEEK_SET);
+        fwrite(buf, 1, chunkSize, f);
+        fclose(f);
+    }
+    free(buf);
+
+    SWARM_MUTEX_LOCK(a->lock);
+    (*a->doneCounter)++;
+    int done = *a->doneCounter;
+    SWARM_MUTEX_UNLOCK(a->lock);
+
+    printf("  [Swarm] Chunk %d done — %d finished (from %s)\n",
+           a->chunkIdx, done, a->peerIP);
+    free(a);
+    return 0;
+}
+
+
+// grabs a file from the swarm — splits it across peers so each one uploads a different chunk
+void downloadSwarmed(const char *filename)
+{
+ 
+    char *peers[MAX_PEERS];
+    int pcount = 0;
+
+    PEER_LOCK();
+    for (int i = 0; i < peerCount; i++)
+        for (int f = 0; f < peerList[i].fileCount; f++)
+            if (strcmp(peerList[i].files[f], filename) == 0)
+            {
+                peers[pcount++] = peerList[i].ip;
+                break;
+            }
+    PEER_UNLOCK();
+
+    if (pcount == 0)
+    {
+        printf("  [Swarm] No peers have '%s'\n", filename);
+        return;
+    }
+
+    long long fileSize = 0;
+    {
+        SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(CHUNK_PORT);
+
+#ifdef _WIN32
+        addr.sin_addr.s_addr = inet_addr(peers[0]);
+#else
+        inet_pton(AF_INET, peers[0], &addr.sin_addr);
+#endif
+
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+        {
+            char req[256];
+            snprintf(req, sizeof(req), "SIZE|%s\n", filename);
+            send(sock, req, (int)strlen(req), 0);
+
+            char resp[64];
+            int i = 0;
+            char ch;
+            while (i < 63 && recv(sock, &ch, 1, 0) == 1 && ch != '\n')
+                resp[i++] = ch;
+            resp[i] = 0;
+            fileSize = atoll(resp);
+        }
+        CLOSE_SOCKET(sock);
+    }
+
+    if (fileSize <= 0)
+    {
+        printf("  [Swarm] Could not get file size from peer\n");
+        return;
+    }
+
+    int totalChunks = (int)((fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    printf("  [Swarm] File: %lld bytes | %d chunks | %d peers\n",
+           fileSize, totalChunks, pcount);
+
+
+    FILE *out = fopen(filename, "wb");
+    if (!out)
+    {
+        printf("  [Swarm] Cannot create output file\n");
+        return;
+    }
+    fseek(out, fileSize - 1, SEEK_SET);
+    fputc(0, out);
+    fclose(out);
+
+
+    int doneCounter = 0;
+    SwarmMutex lock;
+    SWARM_MUTEX_INIT(&lock);
+
+ 
+    for (int c = 0; c < totalChunks; c++)
+    {
+        ChunkArgs *args = (ChunkArgs *)malloc(sizeof(ChunkArgs));
+        strncpy(args->peerIP, peers[c % pcount], 63);
+        strncpy(args->filename, filename, 255);
+        args->chunkIdx = c;
+        args->doneCounter = &doneCounter;
+        args->lock = &lock;
+
+#ifdef _WIN32
+        HANDLE t = CreateThread(NULL, 0, downloadOneChunk, args, 0, NULL);
+        if (t)
+            CloseHandle(t);
+#else
+        pthread_t t;
+        pthread_create(&t, NULL, downloadOneChunk, args);
+        pthread_detach(t);
+#endif
+    }
+
+ 
+    printf("  [Swarm] Downloading");
+    fflush(stdout);
+    while (1)
+    {
+        SWARM_MUTEX_LOCK(&lock);
+        int done = doneCounter;
+        SWARM_MUTEX_UNLOCK(&lock);
+        if (done >= totalChunks)
+            break;
+        sleep_ms(300);
+        printf(".");
+        fflush(stdout);
+    }
+
+    SWARM_MUTEX_DESTROY(&lock);
+    printf("\n  [Swarm] '%s' downloaded successfully!\n\n", filename);
+
+    // register ourselves as a seeder
+    PEER_LOCK();
+    int myIdx = -1;
+    for (int i = 0; i < peerCount; i++)
+        if (strcmp(peerList[i].mac, myMAC) == 0) { myIdx = i; break; }
+
+    if (myIdx >= 0)
+    {
+        char curTime[64];
+        getCurrentTime(curTime, sizeof(curTime));
+        strncpy(peerList[myIdx].timeStr, curTime, sizeof(peerList[myIdx].timeStr) - 1);
+        peerList[myIdx].avail -= fileSize;
+        if (peerList[myIdx].avail < 0) peerList[myIdx].avail = 0;
+
+        bool alreadyHave = false;
+        for (int f = 0; f < peerList[myIdx].fileCount; f++)
+            if (strcmp(peerList[myIdx].files[f], filename) == 0) { alreadyHave = true; break; }
+        if (!alreadyHave)
+            addFileToPeer(&peerList[myIdx], filename);
+
+        char tsnap[64]; strncpy(tsnap, curTime, 63);
+        long long tot = peerList[myIdx].total, av = peerList[myIdx].avail;
+        int fc = peerList[myIdx].fileCount;
+        char fsnap[MAX_FILES][MAX_FILENAME];
+        memcpy(fsnap, peerList[myIdx].files, sizeof(fsnap));
+        sortPeers();
+        savePeers("peers.txt");
+        PEER_UNLOCK();
+
+        broadcastUpdateLine(tsnap, myMAC, myIP, myName, tot, av, fc, fsnap, DISCOVERY_PORT);
+        writeMyInfo(tsnap, myMAC, myIP, myName, tot, av);
+        printf("  [Swarm] Network updated: we now seed '%s'\n", filename);
+    }
+    else { PEER_UNLOCK(); }
+}
+
+
+// Per-connection handler so the chunk server can serve many peers at once
+// one thread per incoming chunk request so we never block other peers waiting
+typedef struct { SocketType sock; } ChunkClientArgs;
+
+#ifdef _WIN32
+DWORD WINAPI handleChunkClient(LPVOID param)
+#else
+void *handleChunkClient(void *param)
+#endif
+{
+    ChunkClientArgs *ca = (ChunkClientArgs *)param;
+    SocketType client = ca->sock;
+    free(ca);
+
+    char cmd[512];
+    int ci = 0;
+    char ch;
+    while (ci < 511 && recv(client, &ch, 1, 0) == 1 && ch != '\n')
+        cmd[ci++] = ch;
+    cmd[ci] = 0;
+
+    if (strncmp(cmd, "SIZE|", 5) == 0)
+    {
+        char *fname = cmd + 5;
+        struct stat st;
+        long long sz = (stat(fname, &st) == 0) ? (long long)st.st_size : 0;
+        char resp[64];
+        snprintf(resp, sizeof(resp), "%lld\n", sz);
+        send(client, resp, (int)strlen(resp), 0);
+    }
+    else if (strncmp(cmd, "CHUNK|", 6) == 0)
+    {
+        char tmp[512];
+        strncpy(tmp, cmd + 6, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = 0;
+        char *fname  = strtok(tmp, "|");
+        char *idxStr = strtok(NULL, "|");
+        if (fname && idxStr)
+        {
+            int idx = atoi(idxStr);
+            FILE *f = fopen(fname, "rb");
+            if (f)
+            {
+                fseek(f, (long long)idx * CHUNK_SIZE, SEEK_SET);
+                char *buf = (char *)malloc(CHUNK_SIZE);
+                int n = (int)fread(buf, 1, CHUNK_SIZE, f);
+                fclose(f);
+                uint32_t sizeNet = htonl((uint32_t)n);
+                send(client, (char *)&sizeNet, 4, 0);
+                sendAll(client, buf, n);
+                free(buf);
+                printf("  [Swarm] Served chunk %d of '%s' (%d bytes)\n", idx, fname, n);
+            }
+        }
+    }
+
+    CLOSE_SOCKET(client);
+    return 0;
+}
+
+#ifdef _WIN32
+DWORD WINAPI chunkServerThread(LPVOID param)
+#else
+void *chunkServerThread(void *param)
+#endif
+{
+    (void)param;
+
+    SocketType srv = socket(AF_INET, SOCK_STREAM, 0);
+    int reuse = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(CHUNK_PORT);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        printf("  [Swarm] Cannot bind chunk server on port %d\n", CHUNK_PORT);
+        return 0;
+    }
+
+    listen(srv, 20);
+    printf("  [Swarm] Chunk server listening on port %d\n", CHUNK_PORT);
+
+    while (1)
+    {
+        struct sockaddr_in ca;
+        socklen_t cl = sizeof(ca);
+        SocketType client = accept(srv, (struct sockaddr *)&ca, &cl);
+        if (client == INVALID_SOCKET)
+            continue;
+
+        // Hand off to a dedicated thread so we can keep accepting immediately
+        ChunkClientArgs *cargs = (ChunkClientArgs *)malloc(sizeof(ChunkClientArgs));
+        cargs->sock = client;
+
+#ifdef _WIN32
+        HANDLE t = CreateThread(NULL, 0, handleChunkClient, cargs, 0, NULL);
+        if (t) CloseHandle(t);
+#else
+        pthread_t t;
+        pthread_create(&t, NULL, handleChunkClient, cargs);
+        pthread_detach(t);
+#endif
+    }
+    return 0;
 }
 
 void sendTxtFile(const char *filepath, const char *targetPeer)
@@ -996,18 +1411,16 @@ void sendTxtFile(const char *filepath, const char *targetPeer)
 
     char info[256];
     snprintf(info, sizeof(info), "%s|%s|%s", myMAC, myIP, myName);
-    uint32_t infoLen = htonl(strlen(info)); 
+    uint32_t infoLen = htonl(strlen(info));
     send(sock, (char *)&infoLen, sizeof(infoLen), 0);
     send(sock, info, ntohl(infoLen), 0);
 
-   const char *filename = "peers.tmp";
+    const char *filename = "peers.tmp";
 
-  
     uint32_t nameLen = htonl(strlen(filename));
     send(sock, (char *)&nameLen, sizeof(nameLen), 0);
     send(sock, filename, ntohl(nameLen), 0);
 
-   
     char buffer[BUFFER_SIZE];
     int bytes;
     int totalBytes = 0;
@@ -1019,11 +1432,12 @@ void sendTxtFile(const char *filepath, const char *targetPeer)
     {
         send(sock, buffer, bytes, 0);
         totalBytes += bytes;
-        if(flag==100){
-        printf(".");
-        flag=0;
+        if (flag == 100)
+        {
+            printf(".");
+            flag = 0;
         }
-        flag ++;
+        flag++;
         fflush(stdout);
     }
 
@@ -1032,7 +1446,6 @@ void sendTxtFile(const char *filepath, const char *targetPeer)
     fclose(file);
     CLOSE_SOCKET(sock);
 }
-
 
 #ifdef _WIN32
 DWORD WINAPI fileServerThread(LPVOID param)
@@ -1058,8 +1471,7 @@ void *fileServerThread(void *param)
         return 0;
     }
 
-    listen(serverSocket, 5);
-    
+    listen(serverSocket, 5);  // handles one upload at a time, fine for now
 
     while (1)
     {
@@ -1083,14 +1495,8 @@ void *fileServerThread(void *param)
 
 void deleteTempFile(const char *filename)
 {
-    if (remove(filename) == 0)
-    {
-        
-    }
-    else
-    {
+    if (remove(filename) != 0)
         perror("Error deleting temp file");
-    }
 }
 
 void sendUnicastMessage(const char *ip, const char *msg, int PORT)
@@ -1130,6 +1536,7 @@ void broadcastMessage(const char *msg, int PORT)
     CLOSE_SOCKET(sock);
 }
 
+// parses "YYYY-MM-DD HH:MM:SS" into time_t so we can compare peer freshness
 time_t convertToTimeT(const char *timestamp)
 {
     struct tm t;
@@ -1145,8 +1552,8 @@ time_t convertToTimeT(const char *timestamp)
         return (time_t)0;
     }
 
-    t.tm_year -= 1900; 
-    t.tm_mon -= 1;     
+    t.tm_year -= 1900;
+    t.tm_mon -= 1;
 
     return mktime(&t);
 }
@@ -1171,7 +1578,7 @@ char *getWinnerIP()
     broadcastMessage(final, DISCOVERY_PORT);
 
     printf("[Sync] Waiting 500ms...\n");
-    sleep_ms(500);
+    sleep_ms(500);  // TODO: could make this configurable
     waitingForResponses = 0;
 
     if (uprespCount == 0)
@@ -1182,7 +1589,6 @@ char *getWinnerIP()
 
     qsort(upresp, uprespCount, sizeof(UpdateResponse), compareResponses);
 
-    
     strncpy(winnerIP, upresp[0].fromIP, sizeof(winnerIP) - 1);
     printf("[Winner] %s\n", winnerIP);
 
@@ -1222,8 +1628,7 @@ void broadcastUpdateLine(
     if (filecount > MAX_FILES)
         filecount = MAX_FILES;
 
-   
-    size_t approx = 512 + (size_t)filecount * (MAX_FILENAME + 4);
+    size_t approx = 1024 + (size_t)filecount * (MAX_FILENAME + 8);  // extra headroom so long filenames don't get cut off
     char *msg = (char *)malloc(approx);
     if (!msg)
         return;
@@ -1242,22 +1647,22 @@ void broadcastUpdateLine(
 
     for (int i = 0; i < filecount && i < MAX_FILES; ++i)
     {
-      
+
         filenames[i][MAX_FILENAME - 1] = '\0';
         n = snprintf(msg + used, approx - used, "|%s", filenames[i]);
         if (n < 0)
             break;
         if ((size_t)n >= approx - used)
-            break; 
+            break;
         used += (size_t)n;
     }
-
 
     broadcastMessage(msg, PORT);
 
     free(msg);
 }
 
+// central dispatcher for all UDP packets we receive
 void handleIncomingMessage(const char *fromIP, char *message)
 {
     char *command = strtok(message, "|");
@@ -1269,7 +1674,8 @@ void handleIncomingMessage(const char *fromIP, char *message)
         return;
     }
 
-
+    // note: every peer replies to I_AM_NEW which is fine for small networks,
+    //       but on a big network this would cause a reply storm — worth fixing later
     if (strcmp(command, "I_AM_NEW") == 0)
     {
         char *timeStr = strtok(NULL, "|");
@@ -1283,8 +1689,53 @@ void handleIncomingMessage(const char *fromIP, char *message)
         {
             long long total = atoll(totalStr);
             long long avail = atoll(availStr);
-            char emptyFiles[1][128] = {""};
-            addOrUpdatePeers(timeStr, mac, ip, name, total, avail, 0, emptyFiles);
+
+           
+            int existingIdx = -1;
+            for (int i = 0; i < peerCount; i++)
+                if (strcmp(peerList[i].mac, mac) == 0)
+                {
+                    existingIdx = i;
+                    break;
+                }
+
+            if (existingIdx >= 0)
+            {
+                // peer reconnected – keep their file list, just refresh connection info
+                PEER_LOCK();
+                Peer *p = &peerList[existingIdx];
+                strncpy(p->ip,     ip,               sizeof(p->ip)     - 1); p->ip[sizeof(p->ip)-1]         = '\0';
+                strncpy(p->name,   name,             sizeof(p->name)   - 1); p->name[sizeof(p->name)-1]     = '\0';
+                strncpy(p->timeStr, timeStr ? timeStr : "", sizeof(p->timeStr) - 1); p->timeStr[sizeof(p->timeStr)-1] = '\0';
+                p->total = total;
+                p->avail = avail;
+                sortPeers();
+                savePeers("peers.txt");
+                PEER_UNLOCK();
+            }
+            else
+            {
+                char emptyFiles[1][128];
+                memset(emptyFiles, 0, sizeof(emptyFiles));
+                addOrUpdatePeers(timeStr, mac, ip, name, total, avail, 0, emptyFiles);
+            }
+
+            // let the new peer know about us right away
+            PEER_LOCK();
+            int myIdx = -1;
+            for (int i = 0; i < peerCount; i++)
+                if (strcmp(peerList[i].mac, myMAC) == 0) { myIdx = i; break; }
+            if (myIdx >= 0)
+            {
+                char curTime[64]; getCurrentTime(curTime, sizeof(curTime));
+                long long t = peerList[myIdx].total, av = peerList[myIdx].avail;
+                int fc = peerList[myIdx].fileCount;
+                char fsnap[MAX_FILES][MAX_FILENAME];
+                memcpy(fsnap, peerList[myIdx].files, sizeof(fsnap));
+                PEER_UNLOCK();
+                broadcastUpdateLine(curTime, myMAC, myIP, myName, t, av, fc, fsnap, DISCOVERY_PORT);
+            }
+            else { PEER_UNLOCK(); }
         }
 
         return;
@@ -1372,7 +1823,7 @@ void handleIncomingMessage(const char *fromIP, char *message)
 
         if (peerCount > peercountRequest || myLastTime > timeAsk)
         {
-            int delay = rand() % 300; 
+            int delay = rand() % 300;
             sleep_ms(delay);
 
             char final[256];
@@ -1385,7 +1836,6 @@ void handleIncomingMessage(const char *fromIP, char *message)
 
     printf("[Warning] Unknown command received: %s\n", command);
 }
-
 
 #ifdef _WIN32
 DWORD WINAPI MessageListener(LPVOID param)
@@ -1476,7 +1926,6 @@ void requestFileFromPeer(const char *filename)
     }
     else
     {
-        
     }
 
     CLOSE_SOCKET(sock);
@@ -1535,7 +1984,7 @@ void *FileRequest(void *param)
 
             if (strncmp(buffer, "FILE_REQUEST|", 13) == 0)
             {
-            
+
                 char bufferCopy[BUFFER_SIZE];
                 strncpy(bufferCopy, buffer, sizeof(bufferCopy) - 1);
                 bufferCopy[sizeof(bufferCopy) - 1] = '\0';
@@ -1546,7 +1995,7 @@ void *FileRequest(void *param)
 
                 if (requesterMAC && filename)
                 {
-                
+
                     char requesterIP[32];
                     strncpy(requesterIP, inet_ntoa(sender.sin_addr), sizeof(requesterIP) - 1);
                     requesterIP[sizeof(requesterIP) - 1] = '\0';
@@ -1554,7 +2003,6 @@ void *FileRequest(void *param)
                     printf("  [Request] From %s (%s) for file: %s\n",
                            requesterIP, requesterMAC, filename);
 
-                  
                     if (strcmp(requesterMAC, localMAC) == 0)
                     {
                         printf("  [Request] Ignoring self-request\n");
@@ -1566,7 +2014,7 @@ void *FileRequest(void *param)
                     {
                         if (strcmp(peerList[i].mac, localMAC) == 0)
                         {
-                         
+
                             for (int f = 0; f < peerList[i].fileCount; f++)
                             {
                                 if (strcmp(peerList[i].files[f], filename) == 0)
@@ -1593,8 +2041,6 @@ void *FileRequest(void *param)
                     }
                     fclose(testFile);
 
-                  
-
                     sendFile(filename, requesterIP);
                 }
             }
@@ -1620,6 +2066,7 @@ void getCurrentTime(char *buffer, size_t size)
     }
 }
 
+// finds whichever peer has the most complete view of the network and downloads their peers.txt
 void sync()
 {
     char *winnerIP = getWinnerIP();
@@ -1630,10 +2077,8 @@ void sync()
         return;
     }
 
-  
     sendUnicastMessage(winnerIP, "I_NEED_PEERSTXT", DISCOVERY_PORT);
 
-   
     sleep_ms(2000);
 
     if (loadPeersFromTmp("peers.tmp"))
@@ -1682,7 +2127,7 @@ bool loadMyInfo()
     FILE *fp = fopen("myself.txt", "r");
     if (!fp)
     {
-        
+
         return false;
     }
 
@@ -1734,6 +2179,7 @@ int main()
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+    InitializeCriticalSection(&peerLock);
 #endif
 
     getMyIP(myIP);
@@ -1758,17 +2204,20 @@ int main()
     CreateThread(NULL, 0, fileServerThread, NULL, 0, NULL);
     CreateThread(NULL, 0, MessageListener, NULL, 0, NULL);
     CreateThread(NULL, 0, FileRequest, NULL, 0, NULL);
+    CreateThread(NULL, 0, chunkServerThread, NULL, 0, NULL);
 #else
-    pthread_t t1, t2, t4;
+    pthread_t t1, t2, t4, t5;
     pthread_create(&t1, NULL, fileServerThread, NULL);
     pthread_create(&t2, NULL, MessageListener, NULL);
     pthread_create(&t4, NULL, FileRequest, NULL);
+    pthread_create(&t5, NULL, chunkServerThread, NULL);
     pthread_detach(t1);
     pthread_detach(t2);
     pthread_detach(t4);
+    pthread_detach(t5);
 #endif
 
-    SLEEP(1);
+    SLEEP(1);  // give background threads a second to bind their ports
 
     showHelp();
 
@@ -1780,7 +2229,7 @@ int main()
         if (scanf("%lld", &contribution) != 1)
             contribution = 0;
         while (getchar() != '\n')
-            ; 
+            ;
 
         int filecount = 0;
         char files[MAX_FILES][128];
@@ -1813,7 +2262,7 @@ int main()
         if (strlen(cmd) == 0)
             continue;
 
-        if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0)
+        if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0)  // accept both
         {
             printf("\n  Goodbye!\n\n");
             break;
@@ -1839,7 +2288,7 @@ int main()
                 continue;
             filename[strcspn(filename, "\n")] = 0;
             printf("\n");
-            requestFileFromPeer(filename);
+            downloadSwarmed(filename);
         }
         else if (strcmp(cmd, "upload") == 0)
         {
@@ -1853,7 +2302,6 @@ int main()
 
             printf("\n");
 
-           
             long long fileSize = getFileSize(filepath);
             if (fileSize < 0)
             {
@@ -1864,12 +2312,10 @@ int main()
             printf("    [Info] File size: %lld bytes (%.2f MB)\n",
                    fileSize, fileSize / (1024.0 * 1024.0));
 
-            
             char *bestPeerIP = NULL;
             int connectedPeerIdx = -1;
             findBestPeer(&bestPeerIP, &connectedPeerIdx);
 
-           
             if (bestPeerIP == NULL || connectedPeerIdx < 0)
             {
                 printf("    [Error] No available peer found.\n");
@@ -1877,13 +2323,13 @@ int main()
                 continue;
             }
 
-          
             char targetPeerMAC[32];
             strncpy(targetPeerMAC, peerList[connectedPeerIdx].mac, sizeof(targetPeerMAC) - 1);
             targetPeerMAC[sizeof(targetPeerMAC) - 1] = '\0';
-            if(fileSize > peerList[connectedPeerIdx].avail ){
-                printf("NOT Enough space");
-                 continue;
+            if (fileSize > peerList[connectedPeerIdx].avail)
+            {
+                printf("    [Error] Not enough free space on that peer.\n");
+                continue;
             }
             printf("    [Selected] Peer: %s (%s) with %lld MB available\n",
                    peerList[connectedPeerIdx].name,
@@ -1892,8 +2338,7 @@ int main()
             Peer temp;
             memset(&temp, 0, sizeof(temp));
 
-           
-            temp = peerList[connectedPeerIdx]; 
+            temp = peerList[connectedPeerIdx];
 
             if (strcmp(bestPeerIP, myIP) == 0)
             {
@@ -1919,7 +2364,6 @@ int main()
                     continue;
                 }
 
-               
                 char currentTime[64];
                 getCurrentTime(currentTime, sizeof(currentTime));
 
@@ -1947,27 +2391,18 @@ int main()
                             peerList[myIdx].name,
                             peerList[myIdx].total,
                             peerList[myIdx].avail);
-                printf("    [OK] written\n");
-
                 strcpy(peerList[myIdx].timeStr, currentTime);
                 peerList[myIdx].avail = temp.avail;
-
                 sortPeers();
                 savePeers("peers.txt");
-
-                printf("    [INFO] saved\n");
-
                 printf("    [Success] Metadata updated.\n\n");
                 continue;
             }
 
-
             printf("    [Uploading] Sending to %s...\n", bestPeerIP);
             sendFile(filepath, bestPeerIP);
-            char *filename = strrchr(filepath, '/');
-            if (!filename)
-                filename = strrchr(filepath, '\\');
-            filename = filename ? filename + 1 : (char *)filepath;
+
+            
             int targetIdx = -1;
             for (int i = 0; i < peerCount; i++)
             {
@@ -1978,46 +2413,16 @@ int main()
                 }
             }
 
-            if (targetIdx < 0)
+            if (targetIdx >= 0)
             {
-                printf("    [Warning] Cannot find target peer in list to update metadata\n");
-                continue;
+                peerList[targetIdx].avail -= fileSize;
+                if (peerList[targetIdx].avail < 0)
+                    peerList[targetIdx].avail = 0;
+                sortPeers();
+                savePeers("peers.txt");
             }
 
-            char currentTime[64];
-            getCurrentTime(currentTime, sizeof(currentTime));
-
-            strcpy(peerList[targetIdx].timeStr, currentTime);
-            strcpy(temp.timeStr, currentTime);
-            peerList[targetIdx].avail -= fileSize;
-            temp.avail -= fileSize;
-
-            SLEEP(1);
-            addFileToPeer(&peerList[targetIdx], filename);
-            addFileToPeer(&temp, filename);
-            printf("    [INFO] Broadcasting\n");
-            broadcastUpdateLine(currentTime,
-                                temp.mac,
-                                temp.ip,
-                                temp.name,
-                                temp.total,
-                                temp.avail,
-                                temp.fileCount,
-                                temp.files,
-                                DISCOVERY_PORT);
-            printf("    [INFO] Broadcasted\n");
-
-            
-            strcpy(peerList[targetIdx].timeStr, currentTime);
-            peerList[targetIdx].avail = temp.avail;
-
-            sortPeers();
-            savePeers("peers.txt");
-           
-
-            printf("    [INFO] saved\n");
-
-            printf("    [Success] Upload complete and metadata updated.\n\n");
+            printf("    [Success] Upload complete. Receiver will announce the file.\n\n");
         }
         else
         {
